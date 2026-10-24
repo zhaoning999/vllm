@@ -62,6 +62,10 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
     CompressedTensorsW4A4Nvfp4MoEMethod,
 )
+from vllm.model_executor.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+)
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptLinearMethod,
@@ -108,6 +112,7 @@ from vllm.model_executor.layers.quantization.utils import quant_utils
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
+    mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     ref_nvfp4_quant,
@@ -138,6 +143,7 @@ from vllm.model_executor.models.granitemoe import (
     GraniteMoeModel,
 )
 from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_trtllm_fused_moe,
@@ -502,6 +508,144 @@ def test_online_block_fp8_requantization_removes_source_scales(
 
         assert not hasattr(layer, "weight_scale")
         assert layer.weight_scale_inv.numel() > 0
+
+
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+@pytest.mark.parametrize(
+    "size", [pytest.param(128, id="aligned"), pytest.param(192, id="partial-block")]
+)
+def test_fp8_block_dequantize_weight_matches_reference(
+    size: int, use_ue8m0: bool
+) -> None:
+    """Blockwise FP8 dequantization scales each block by its own factor."""
+    torch.manual_seed(0)
+    weight_bf16 = torch.randn(size, size, device=DEVICE, dtype=torch.bfloat16)
+    weight, weight_scale_inv = per_block_cast_to_fp8(
+        weight_bf16, block_size=[128, 128], use_ue8m0=use_ue8m0
+    )
+    if use_ue8m0:
+        # UE8M0 scales are powers of two and fit the e8m0 dtype exactly.
+        weight_scale_inv = weight_scale_inv.to(torch.float8_e8m0fnu)
+
+    source = Fp8LinearMethod.__new__(Fp8LinearMethod)
+    source.block_quant = True
+    source.weight_block_size = [128, 128]
+    dequantized = source.dequantize_weight(
+        SimpleNamespace(weight=weight, weight_scale_inv=weight_scale_inv)
+    )
+
+    scale = weight_scale_inv.to(torch.float32)
+    scale = torch.repeat_interleave(scale, 128, dim=0)
+    scale = torch.repeat_interleave(scale, 128, dim=1)[:size, :size]
+    reference = (weight.to(torch.float32) * scale).to(torch.bfloat16)
+    torch.testing.assert_close(dequantized, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_rocm())
+    or not is_quant_method_supported("fp8"),
+    reason="Requires FP8 support on CUDA or ROCm.",
+)
+def test_online_mxfp8_requantization_from_block_fp8(
+    default_vllm_config, dist_init, workspace_init, monkeypatch
+) -> None:
+    """Blockwise FP8 linears re-quantize to MXFP8 from dequantized weights."""
+    default_vllm_config.model_config = ModelConfig(dtype="bfloat16")
+    # Kernel selection is orthogonal to the weight conversion under test.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.init_fp8_linear_kernel",
+        lambda **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.mxfp8."
+        "init_mxfp8_linear_kernel",
+        lambda **kwargs: Mock(),
+    )
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
+    quant_config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(linear="mxfp8")
+    )
+    with set_default_torch_dtype(torch.bfloat16), torch.device(DEVICE):
+        layer = ColumnParallelLinear(
+            input_size=256,
+            output_size=256,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=quant_config,
+            prefix="model.layers.0.self_attn.o_proj",
+            disable_tp=True,
+        )
+        target = layer.quant_method
+        assert isinstance(target, Mxfp8OnlineLinearMethod)
+        source = target.requantization_source
+        assert isinstance(source, Fp8LinearMethod)
+
+        torch.manual_seed(11)
+        checkpoint_weight = torch.randn(256, 256, dtype=torch.bfloat16)
+        weight, weight_scale_inv = per_block_cast_to_fp8(
+            checkpoint_weight, block_size=[128, 128]
+        )
+        with torch.no_grad():
+            layer.weight.copy_(weight)
+            layer.weight_scale_inv.copy_(weight_scale_inv)
+
+        target.process_weights_after_loading(layer)
+
+        # The MXFP8 weight must match quantizing the dequantized checkpoint.
+        dequantized = source.dequantize_weight(
+            SimpleNamespace(weight=weight, weight_scale_inv=weight_scale_inv)
+        )
+        expected_weight, expected_scale = mxfp8_e4m3_quantize(
+            dequantized.contiguous()
+        )
+        torch.testing.assert_close(
+            layer.weight.data, expected_weight, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            layer.weight_scale.data, expected_scale, rtol=0, atol=0
+        )
+        # Source scales must be released after successful requantization.
+        assert not hasattr(layer, "weight_scale_inv")
+        assert layer.input_scale is None
+
+
+def test_online_mxfp8_requantization_rejects_per_tensor_fp8(
+    default_vllm_config, dist_init, monkeypatch
+) -> None:
+    """Per-tensor FP8 checkpoints cannot yet re-quantize to MXFP8 online."""
+    default_vllm_config.model_config = ModelConfig(dtype="bfloat16")
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.init_fp8_linear_kernel",
+        lambda **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.mxfp8."
+        "init_mxfp8_linear_kernel",
+        lambda **kwargs: Mock(),
+    )
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+    )
+    quant_config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(linear="mxfp8")
+    )
+    layer = ColumnParallelLinear(
+        input_size=32,
+        output_size=32,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=quant_config,
+        prefix="model.layers.0.self_attn.o_proj",
+        disable_tp=True,
+    )
+    assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
+    with pytest.raises(NotImplementedError, match="only supported for blockwise"):
+        layer.quant_method.process_weights_after_loading(layer)
 
 
 def test_online_ignore_keeps_checkpoint_quantization_linear(

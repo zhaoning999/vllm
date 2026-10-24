@@ -112,6 +112,7 @@ Currently supported combinations are:
 | Checkpoint layer | Online target | Requirements |
 | ---------------- | ------------- | ------------ |
 | Serialized ModelOpt MXFP8 linear | any online linear method | Target-specific hardware requirements |
+| Serialized blockwise FP8 linear (`fp8` with `weight_block_size`) | any online linear method | Per-tensor FP8 checkpoints are not yet supported |
 | Serialized compressed-tensors NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
 | Serialized ModelOpt NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
 | Serialized Quark NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
@@ -123,6 +124,14 @@ per-channel-weight/per-token-activation FP8 at load time:
 vllm serve MiniMaxAI/MiniMax-M3-MXFP8 \
   --linear-backend auto \
   --quantization-config.linear fp8_per_channel
+```
+
+Blockwise FP8 checkpoints (DeepSeek-style `fp8` with `weight_block_size`) can
+be re-quantized to MXFP8 the same way:
+
+```bash
+vllm serve deepseek-ai/DeepSeek-V3 \
+  --quantization-config.linear mxfp8
 ```
 
 Similarly, for example, NVFP4 MoE checkpoints can be re-quantized to any online MoE method,

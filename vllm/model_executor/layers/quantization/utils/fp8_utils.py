@@ -1166,6 +1166,33 @@ def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     return fp32_bits.view(torch.float32)
 
 
+def dequant_fp8_block_to_bf16(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    block_size: Sequence[int] = (128, 128),
+) -> torch.Tensor:
+    """Dequantize blockwise FP8 weights to BF16 for online requantization.
+
+    Args:
+        weight: Block-quantized weight stored in a float8 dtype, with shape
+            ``(..., N, K)``.
+        weight_scale_inv: Per-block scale with shape
+            ``(..., ceil(N / block_n), ceil(K / block_k))``, float32 or ue8m0.
+        block_size: 2-element ``[block_n, block_k]`` quantization block shape.
+
+    Returns:
+        The dequantized weights in BF16, with the shape of ``weight``.
+    """
+    if weight_scale_inv.dtype == torch.float8_e8m0fnu:
+        weight_scale_inv = _upcast_e8m0_to_fp32(weight_scale_inv)
+    n, k = weight.shape[-2], weight.shape[-1]
+    block_n, block_k = int(block_size[0]), int(block_size[1])
+    scale_expanded = torch.repeat_interleave(weight_scale_inv, block_n, dim=-2)
+    scale_expanded = torch.repeat_interleave(scale_expanded, block_k, dim=-1)
+    scale_expanded = scale_expanded[..., :n, :k]
+    return (weight.to(torch.float32) * scale_expanded).to(torch.bfloat16)
+
+
 def deepgemm_post_process_weight_scale_block(
     ws: torch.Tensor,
     mn: int,

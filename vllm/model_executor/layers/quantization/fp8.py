@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
+    dequant_fp8_block_to_bf16,
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
@@ -414,6 +415,18 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.input_scale = None
 
         self.fp8_linear.process_weights_after_loading(layer)
+
+    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        """Dequantize serialized blockwise FP8 weights for requantization."""
+        if not self.block_quant:
+            raise NotImplementedError(
+                "FP8 weight dequantization is only supported for blockwise "
+                "(weight_block_size) FP8 checkpoints."
+            )
+        assert self.weight_block_size is not None
+        return dequant_fp8_block_to_bf16(
+            layer.weight, layer.weight_scale_inv, self.weight_block_size
+        )
 
     def apply(
         self,
